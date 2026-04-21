@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,39 +53,49 @@ import (
 )
 
 const (
-	mgrName                       = "LoxilbLoadBalancerManager"
-	resyncPeriod                  = 60 * time.Second
-	minRetryDelay                 = 2 * time.Second
-	maxRetryDelay                 = 120 * time.Second
-	defaultWorkers                = 1
-	LoxiMaxWeight                 = 10
-	LoxiMultusServiceAnnotation   = "loxilb.io/multus-nets"
-	PoolNameAnnotation            = "loxilb.io/poolSelect"
-	SecPoolNameAnnotation         = "loxilb.io/poolSelectSecondary"
-	secIPsAnnotation              = "loxilb.io/secondaryIPs"
-	staticIPAnnotation            = "loxilb.io/staticIP"
-	livenessAnnotation            = "loxilb.io/liveness"
-	lbModeAnnotation              = "loxilb.io/lbmode"
-	lbAddressAnnotation           = "loxilb.io/ipam"
-	lbTimeoutAnnotation           = "loxilb.io/timeout"
-	probeTypeAnnotation           = "loxilb.io/probetype"
-	probePortAnnotation           = "loxilb.io/probeport"
-	probeReqAnnotation            = "loxilb.io/probereq"
-	probeRespAnnotation           = "loxilb.io/proberesp"
-	probeTimeoutAnnotation        = "loxilb.io/probetimeout"
-	probeRetriesAnnotation        = "loxilb.io/proberetries"
-	endPointSelAnnotation         = "loxilb.io/epselect"
-	zoneSelAnnotation             = "loxilb.io/zoneselect"
-	prefLocalPodAnnotation        = "loxilb.io/prefLocalPod"
-	matchNodeLabelAnnotation      = "loxilb.io/nodelabel"
-	usePodNetworkAnnotation       = "loxilb.io/usepodnetwork"
-	useExternalEndpointAnnotation = "loxilb.io/useExternalEndpoint"
-	MaxExternalSecondaryIPsNum    = 4
-	defaultPoolName               = "defaultPool"
-	loxilbZoneLabelKey            = "loxilb.io/zonelabel"
-	loxilbZoneInstance            = "loxilb.io/zoneinstance"
-	enProxyProtov2Annotation      = "loxilb.io/useproxyprotov2"
-	egressAnnotation              = "loxilb.io/egress"
+	mgrName                            = "LoxilbLoadBalancerManager"
+	resyncPeriod                       = 60 * time.Second
+	minRetryDelay                      = 2 * time.Second
+	maxRetryDelay                      = 120 * time.Second
+	defaultWorkers                     = 1
+	LoxiMaxWeight                      = 10
+	LoxiMultusServiceAnnotation        = "loxilb.io/multus-nets"
+	PoolNameAnnotation                 = "loxilb.io/poolSelect"
+	SecPoolNameAnnotation              = "loxilb.io/poolSelectSecondary"
+	secIPsAnnotation                   = "loxilb.io/secondaryIPs"
+	staticIPAnnotation                 = "loxilb.io/staticIP"
+	livenessAnnotation                 = "loxilb.io/liveness"
+	lbModeAnnotation                   = "loxilb.io/lbmode"
+	lbAddressAnnotation                = "loxilb.io/ipam"
+	lbTimeoutAnnotation                = "loxilb.io/timeout"
+	probeTypeAnnotation                = "loxilb.io/probetype"
+	probePortAnnotation                = "loxilb.io/probeport"
+	probeReqAnnotation                 = "loxilb.io/probereq"
+	probeRespAnnotation                = "loxilb.io/proberesp"
+	probeTimeoutAnnotation             = "loxilb.io/probetimeout"
+	probeRetriesAnnotation             = "loxilb.io/proberetries"
+	endPointSelAnnotation              = "loxilb.io/epselect"
+	zoneSelAnnotation                  = "loxilb.io/zoneselect"
+	prefLocalPodAnnotation             = "loxilb.io/prefLocalPod"
+	matchNodeLabelAnnotation           = "loxilb.io/nodelabel"
+	usePodNetworkAnnotation            = "loxilb.io/usepodnetwork"
+	useExternalEndpointAnnotation      = "loxilb.io/useExternalEndpoint"
+	MaxExternalSecondaryIPsNum         = 4
+	defaultPoolName                    = "defaultPool"
+	loxilbZoneLabelKey                 = "loxilb.io/zonelabel"
+	loxilbZoneInstance                 = "loxilb.io/zoneinstance"
+	enProxyProtov2Annotation           = "loxilb.io/useproxyprotov2"
+	egressAnnotation                   = "loxilb.io/egress"
+	lbSecAnnotation                    = "loxilb.io/lbsec"
+	hostAnnotation                     = "loxilb.io/host"
+	backendProtocolAnnotation          = "loxilb.io/backend-protocol"
+	sseModeAnnotation                  = "loxilb.io/sse-mode"
+	maxStreamDurationAnnotation        = "loxilb.io/max-stream-duration"
+	backendKeepaliveIntervalAnnotation = "loxilb.io/backend-keepalive-interval"
+	sessionHeaderNameAnnotation        = "loxilb.io/session-header-name"
+	pathPrefixAnnotation               = "loxilb.io/path-prefix"
+	pathMatchModeAnnotation            = "loxilb.io/path-match-mode"
+	modelNameAnnotation                = "loxilb.io/model-name"
 	// mTLS Frontend annotations
 	mtlsFrontendModeAnnotation      = "loxilb.io/mtls-frontend-mode"
 	mtlsFrontendSecretAnnotation    = "loxilb.io/mtls-frontend-secret"
@@ -109,6 +120,8 @@ type Manager struct {
 	serviceInformer     coreinformers.ServiceInformer
 	serviceLister       corelisters.ServiceLister
 	serviceListerSynced cache.InformerSynced
+	podLister           corelisters.PodLister
+	podListerSynced     cache.InformerSynced
 	nodeInformer        coreinformers.NodeInformer
 	nodeLister          corelisters.NodeLister
 	nodeListerSynced    cache.InformerSynced
@@ -143,7 +156,17 @@ type LbArgs struct {
 	probeTimeo          uint32
 	probeRetries        int
 	secIPs              []string
-	endpointIPs         []string
+	endpoints           []k8s.EndpointEntry
+	lbSec               int32
+	host                string
+	backendProtocol     api.BackendProtocolType
+	sseMode             bool
+	maxStreamDuration   uint32
+	backendKeepalive    uint32
+	sessionHeaderName   string
+	pathPrefix          string
+	pathMatchMode       api.PathMatchModeType
+	modelName           string
 	needMultusEP        bool
 	usePodNetwork       bool
 	useExternalEndpoint bool
@@ -169,27 +192,39 @@ type LbServicePairEntry struct {
 }
 
 type LbCacheEntry struct {
-	LbMode         int
-	Timeout        int
-	ActCheck       bool
-	PrefLocal      bool
-	ppv2En         bool
-	egress         bool
-	Inst           string
-	Addr           string
-	State          string
-	NodeLabel      string
-	ProbeType      string
-	ProbePort      uint16
-	ProbeReq       string
-	ProbeResp      string
-	ProbeTimeo     uint32
-	ProbeRetries   int
-	EpSelect       api.EpSelect
-	IPPool         *ippool.IPPool
-	SIPPools       []*ippool.IPPool
-	SecIPs         []string
-	LbServicePairs map[string]*LbServicePairEntry
+	LbMode            int
+	Timeout           int
+	ActCheck          bool
+	PrefLocal         bool
+	ppv2En            bool
+	egress            bool
+	Inst              string
+	Addr              string
+	State             string
+	NodeLabel         string
+	ProbeType         string
+	ProbePort         uint16
+	ProbeReq          string
+	ProbeResp         string
+	ProbeTimeo        uint32
+	ProbeRetries      int
+	EpSelect          api.EpSelect
+	LbSec             int32
+	Host              string
+	BackendProtocol   api.BackendProtocolType
+	SSEMode           bool
+	MaxStreamDuration uint32
+	BackendKeepalive  uint32
+	SessionHeaderName string
+	PathPrefix        string
+	PathMatchMode     api.PathMatchModeType
+	ModelName         string
+	MtlsFrontend      *api.MtlsFrontend
+	MtlsBackend       *api.MtlsBackend
+	IPPool            *ippool.IPPool
+	SIPPools          []*ippool.IPPool
+	SecIPs            []string
+	LbServicePairs    map[string]*LbServicePairEntry
 }
 
 type LbCacheTable map[string]*LbCacheEntry
@@ -246,6 +281,7 @@ func NewLoadBalancerManager(
 	informerFactory informers.SharedInformerFactory) *Manager {
 
 	serviceInformer := informerFactory.Core().V1().Services()
+	podInformer := informerFactory.Core().V1().Pods()
 	nodeInformer := informerFactory.Core().V1().Nodes()
 	endpointSliceInformer := informerFactory.Discovery().V1().EndpointSlices()
 
@@ -259,6 +295,8 @@ func NewLoadBalancerManager(
 		serviceInformer:     serviceInformer,
 		serviceLister:       serviceInformer.Lister(),
 		serviceListerSynced: serviceInformer.Informer().HasSynced,
+		podLister:           podInformer.Lister(),
+		podListerSynced:     podInformer.Informer().HasSynced,
 		nodeInformer:        nodeInformer,
 		nodeLister:          nodeInformer.Lister(),
 		nodeListerSynced:    nodeInformer.Informer().HasSynced,
@@ -334,6 +372,7 @@ func (m *Manager) Run(stopCh <-chan struct{}) {
 		mgrName,
 		stopCh,
 		m.serviceListerSynced,
+		m.podListerSynced,
 		m.nodeListerSynced,
 		m.endpointSliceSynced) {
 		return
@@ -437,6 +476,16 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 	probeRetries := 0
 	prefLocal := false
 	epSelect := api.LbSelRr
+	lbSec := int32(0)
+	host := ""
+	backendProtocol := api.BackendProtocolType("")
+	sseMode := false
+	maxStreamDuration := uint32(0)
+	backendKeepalive := uint32(0)
+	sessionHeaderName := ""
+	pathPrefix := ""
+	pathMatchMode := api.PathMatchModeType("")
+	modelName := ""
 	matchNodeLabel := ""
 	usePodNet := false
 	useExternalEndpoint := false
@@ -564,6 +613,67 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		}
 	}
 
+	if lbsec := svc.Annotations[lbSecAnnotation]; lbsec != "" {
+		switch lbsec {
+		case "https":
+			lbSec = 1
+		case "e2ehttps":
+			lbSec = 2
+		default:
+			klog.Warningf("invalid %s value %q for service %s/%s", lbSecAnnotation, lbsec, svc.Namespace, svc.Name)
+		}
+	}
+
+	if hostVal := svc.Annotations[hostAnnotation]; hostVal != "" {
+		host = hostVal
+	}
+
+	if backendProtocolVal := svc.Annotations[backendProtocolAnnotation]; backendProtocolVal != "" {
+		candidate := api.BackendProtocolType(backendProtocolVal)
+		if candidate.IsValid() {
+			backendProtocol = candidate
+		} else {
+			klog.Warningf("invalid %s value %q for service %s/%s", backendProtocolAnnotation, backendProtocolVal, svc.Namespace, svc.Name)
+		}
+	}
+
+	if sseVal := svc.Annotations[sseModeAnnotation]; sseVal != "" {
+		sseMode = sseVal == "yes"
+	}
+
+	if durationVal := svc.Annotations[maxStreamDurationAnnotation]; durationVal != "" {
+		if parsed, err := strconv.ParseUint(durationVal, 10, 32); err == nil {
+			maxStreamDuration = uint32(parsed)
+		}
+	}
+
+	if keepaliveVal := svc.Annotations[backendKeepaliveIntervalAnnotation]; keepaliveVal != "" {
+		if parsed, err := strconv.ParseUint(keepaliveVal, 10, 32); err == nil {
+			backendKeepalive = uint32(parsed)
+		}
+	}
+
+	if sessionHeader := svc.Annotations[sessionHeaderNameAnnotation]; sessionHeader != "" {
+		sessionHeaderName = sessionHeader
+	}
+
+	if prefixVal := svc.Annotations[pathPrefixAnnotation]; prefixVal != "" {
+		pathPrefix = prefixVal
+	}
+
+	if pathModeVal := svc.Annotations[pathMatchModeAnnotation]; pathModeVal != "" {
+		candidate := api.PathMatchModeType(pathModeVal)
+		if candidate.IsValid() {
+			pathMatchMode = candidate
+		} else {
+			klog.Warningf("invalid %s value %q for service %s/%s", pathMatchModeAnnotation, pathModeVal, svc.Namespace, svc.Name)
+		}
+	}
+
+	if modelNameVal, ok := svc.Annotations[modelNameAnnotation]; ok {
+		modelName = modelNameVal
+	}
+
 	// Check for loxilb specific annotations - mTLS configuration
 	mtlsFrontend, err := m.getMtlsFrontendConfig(svc)
 	if err != nil {
@@ -623,6 +733,10 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		} else {
 			lbMode = api.LBModeNotSupported
 		}
+	}
+
+	if lbSec == 2 && lbMode != api.LBModeFullProxy {
+		klog.Warningf("service %s/%s uses %s=e2ehttps without fullproxy mode", svc.Namespace, svc.Name, lbSecAnnotation)
 	}
 
 	// Check for loxilb specific annotations - Liveness Check
@@ -699,6 +813,8 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 	switch eps {
 	case "hash":
 		epSelect = api.LbSelHash
+	case "prio":
+		epSelect = api.LbSelPrio
 	case "persist":
 		epSelect = api.LbSelRrPersist
 	case "lc":
@@ -706,9 +822,15 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 	case "n2":
 		epSelect = api.LbSelN2
 	case "n2det":
-		epSelect = api.LbSelN2DET
+		epSelect = api.LbSelN2
 	case "n3":
 		epSelect = api.LbSelN3
+	case "chwbl":
+		epSelect = api.LbSelCHWBL
+	case "gpuaware":
+		epSelect = api.LbSelGPUAware
+	case "wrrhash":
+		epSelect = api.LbSelWRRHash
 	case "rr":
 		epSelect = api.LbSelRr
 	case "roundrobin":
@@ -720,16 +842,16 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 	cacheKey := GenKey(svc.Namespace, svc.Name)
 	lbCacheEntry, added := m.lbCache[cacheKey]
 
-	endpointIPs, err := m.getEndpoints(svc, usePodNet, useExternalEndpoint, needMultusEP, epAddrType, matchNodeLabel)
+	endpoints, err := m.getEndpoints(svc, usePodNet, useExternalEndpoint, needMultusEP, epAddrType, matchNodeLabel, false)
 	if err != nil {
 		if !added {
-			klog.V(4).Infof("endpointIPs: %v", endpointIPs)
+			klog.V(4).Infof("endpoints: %v", endpoints)
 			return errors.Wrap(err, "getEndpoints return error")
 		}
 	}
 
 	if !added {
-		if len(endpointIPs) <= 0 {
+		if len(endpoints) <= 0 {
 			return errors.New("no active endpoints")
 		}
 
@@ -745,26 +867,38 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 				}
 			}
 			addNewLbCacheEntryChan <- &LbCacheEntry{
-				LbMode:         lbMode,
-				ActCheck:       livenessCheck,
-				PrefLocal:      prefLocal,
-				Timeout:        timeout,
-				State:          "Added",
-				NodeLabel:      matchNodeLabel,
-				ProbeType:      probeType,
-				ProbePort:      uint16(probePort),
-				ProbeReq:       probeReq,
-				ProbeResp:      probeResp,
-				ProbeTimeo:     probeTimeout,
-				ProbeRetries:   probeRetries,
-				EpSelect:       epSelect,
-				Addr:           addrType,
-				SecIPs:         []string{},
-				IPPool:         ipPool,
-				SIPPools:       sipPools,
-				Inst:           zoneInstName,
-				ppv2En:         enProxyProtov2,
-				LbServicePairs: make(map[string]*LbServicePairEntry),
+				LbMode:            lbMode,
+				ActCheck:          livenessCheck,
+				PrefLocal:         prefLocal,
+				Timeout:           timeout,
+				State:             "Added",
+				NodeLabel:         matchNodeLabel,
+				ProbeType:         probeType,
+				ProbePort:         uint16(probePort),
+				ProbeReq:          probeReq,
+				ProbeResp:         probeResp,
+				ProbeTimeo:        probeTimeout,
+				ProbeRetries:      probeRetries,
+				EpSelect:          epSelect,
+				LbSec:             lbSec,
+				Host:              host,
+				BackendProtocol:   backendProtocol,
+				SSEMode:           sseMode,
+				MaxStreamDuration: maxStreamDuration,
+				BackendKeepalive:  backendKeepalive,
+				SessionHeaderName: sessionHeaderName,
+				PathPrefix:        pathPrefix,
+				PathMatchMode:     pathMatchMode,
+				ModelName:         modelName,
+				MtlsFrontend:      mtlsFrontend,
+				MtlsBackend:       mtlsBackend,
+				Addr:              addrType,
+				SecIPs:            []string{},
+				IPPool:            ipPool,
+				SIPPools:          sipPools,
+				Inst:              zoneInstName,
+				ppv2En:            enProxyProtov2,
+				LbServicePairs:    make(map[string]*LbServicePairEntry),
 			}
 		}()
 
@@ -773,7 +907,7 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		m.zoneInstSelHint++
 		klog.Infof("New LbCache %s Added", cacheKey)
 	} else {
-		if len(endpointIPs) <= 0 {
+		if len(endpoints) <= 0 {
 			err := m.deleteLoadBalancer(svc.Namespace, svc.Name, false)
 			if err == nil {
 				m.removeAllCacheEndpoints(cacheKey)
@@ -942,6 +1076,90 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 		klog.Infof("%s: EpSelect update", cacheKey)
 	}
 
+	if lbSec != m.lbCache[cacheKey].LbSec {
+		m.lbCache[cacheKey].LbSec = lbSec
+		update = true
+		if added {
+			needDelete = true
+		}
+		klog.Infof("%s: lbsec update", cacheKey)
+	}
+
+	if host != m.lbCache[cacheKey].Host {
+		m.lbCache[cacheKey].Host = host
+		update = true
+		klog.Infof("%s: host update", cacheKey)
+	}
+
+	if backendProtocol != m.lbCache[cacheKey].BackendProtocol {
+		m.lbCache[cacheKey].BackendProtocol = backendProtocol
+		update = true
+		if added {
+			needDelete = true
+		}
+		klog.Infof("%s: backend protocol update", cacheKey)
+	}
+
+	if sseMode != m.lbCache[cacheKey].SSEMode {
+		m.lbCache[cacheKey].SSEMode = sseMode
+		update = true
+		klog.Infof("%s: sse mode update", cacheKey)
+	}
+
+	if maxStreamDuration != m.lbCache[cacheKey].MaxStreamDuration {
+		m.lbCache[cacheKey].MaxStreamDuration = maxStreamDuration
+		update = true
+		klog.Infof("%s: max stream duration update", cacheKey)
+	}
+
+	if backendKeepalive != m.lbCache[cacheKey].BackendKeepalive {
+		m.lbCache[cacheKey].BackendKeepalive = backendKeepalive
+		update = true
+		klog.Infof("%s: backend keepalive update", cacheKey)
+	}
+
+	if sessionHeaderName != m.lbCache[cacheKey].SessionHeaderName {
+		m.lbCache[cacheKey].SessionHeaderName = sessionHeaderName
+		update = true
+		klog.Infof("%s: session header update", cacheKey)
+	}
+
+	if pathPrefix != m.lbCache[cacheKey].PathPrefix {
+		m.lbCache[cacheKey].PathPrefix = pathPrefix
+		update = true
+		klog.Infof("%s: path prefix update", cacheKey)
+	}
+
+	if pathMatchMode != m.lbCache[cacheKey].PathMatchMode {
+		m.lbCache[cacheKey].PathMatchMode = pathMatchMode
+		update = true
+		klog.Infof("%s: path match mode update", cacheKey)
+	}
+
+	if modelName != m.lbCache[cacheKey].ModelName {
+		m.lbCache[cacheKey].ModelName = modelName
+		update = true
+		klog.Infof("%s: model name update", cacheKey)
+	}
+
+	if !reflect.DeepEqual(mtlsFrontend, m.lbCache[cacheKey].MtlsFrontend) {
+		m.lbCache[cacheKey].MtlsFrontend = mtlsFrontend
+		update = true
+		if added {
+			needDelete = true
+		}
+		klog.Infof("%s: mtls frontend update", cacheKey)
+	}
+
+	if !reflect.DeepEqual(mtlsBackend, m.lbCache[cacheKey].MtlsBackend) {
+		m.lbCache[cacheKey].MtlsBackend = mtlsBackend
+		update = true
+		if added {
+			needDelete = true
+		}
+		klog.Infof("%s: mtls backend update", cacheKey)
+	}
+
 	if enProxyProtov2 != m.lbCache[cacheKey].ppv2En {
 		m.lbCache[cacheKey].ppv2En = enProxyProtov2
 		update = true
@@ -990,7 +1208,7 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 	}
 
 	if !update {
-		update = m.checkUpdateEndpoints(svc, cacheKey, endpointIPs, useExternalEndpoint) || m.checkUpdateExternalIP(ingSvcPairs, svc)
+		update = m.checkUpdateEndpoints(svc, cacheKey, endpoints, useExternalEndpoint) || m.checkUpdateExternalIP(ingSvcPairs, svc)
 	}
 
 	if !update {
@@ -1024,7 +1242,7 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 			svc.Status.LoadBalancer.Ingress = nil
 		}
 		klog.Infof("%s: Added(%v) Update(%v) needDelete(%v)", cacheKey, added, update, needDelete)
-		klog.Infof("Endpoint IP Pairs %v", endpointIPs)
+		klog.Infof("Endpoint Pairs %v", endpoints)
 		klog.Infof("Secondary IP Pairs %v", m.lbCache[cacheKey].SecIPs)
 	}
 
@@ -1045,6 +1263,16 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 			probeTimeo:          m.lbCache[cacheKey].ProbeTimeo,
 			probeRetries:        m.lbCache[cacheKey].ProbeRetries,
 			sel:                 m.lbCache[cacheKey].EpSelect,
+			lbSec:               m.lbCache[cacheKey].LbSec,
+			host:                m.lbCache[cacheKey].Host,
+			backendProtocol:     m.lbCache[cacheKey].BackendProtocol,
+			sseMode:             m.lbCache[cacheKey].SSEMode,
+			maxStreamDuration:   m.lbCache[cacheKey].MaxStreamDuration,
+			backendKeepalive:    m.lbCache[cacheKey].BackendKeepalive,
+			sessionHeaderName:   m.lbCache[cacheKey].SessionHeaderName,
+			pathPrefix:          m.lbCache[cacheKey].PathPrefix,
+			pathMatchMode:       m.lbCache[cacheKey].PathMatchMode,
+			modelName:           m.lbCache[cacheKey].ModelName,
 			inst:                m.lbCache[cacheKey].Inst,
 			ppv2En:              m.lbCache[cacheKey].ppv2En,
 			egress:              m.lbCache[cacheKey].egress,
@@ -1055,7 +1283,7 @@ func (m *Manager) addLoadBalancer(svc *corev1.Service) error {
 			mtlsBackend:         mtlsBackend,
 		}
 		lbArgs.secIPs = append(lbArgs.secIPs, m.lbCache[cacheKey].SecIPs...)
-		lbArgs.endpointIPs = append(lbArgs.endpointIPs, endpointIPs...)
+		lbArgs.endpoints = append(lbArgs.endpoints, endpoints...)
 		if privateIPStr != "" {
 			lbArgs.privateIP = privateIPStr
 		}
@@ -1392,13 +1620,13 @@ func (m *Manager) getNodeEndpointsWithLabelWithKey(addrType string, key, matchLa
 	return endpoints, nil
 }
 
-// getEndpoints return LB's endpoints IP list.
+// getEndpoints return LB endpoint entries.
 // If podEP is true, return multus endpoints list.
 // If false, return worker nodes IP list.
-func (m *Manager) getEndpoints(svc *corev1.Service, usePodNet, useExternalEndpoint, useMultusNet bool, addrType, matchNodeLabel string) ([]string, error) {
+func (m *Manager) getEndpoints(svc *corev1.Service, usePodNet, useExternalEndpoint, useMultusNet bool, addrType, matchNodeLabel string, readMeta bool) ([]k8s.EndpointEntry, error) {
 	if useMultusNet {
-		//klog.Infof("getEndpoints: Pod end-points")
-		return m.getMultusEndpoints(svc, addrType)
+		endpoints, err := m.getMultusEndpoints(svc, addrType)
+		return makeEndpointEntries(endpoints), err
 	}
 
 	var matchNodeList []string
@@ -1415,15 +1643,25 @@ func (m *Manager) getEndpoints(svc *corev1.Service, usePodNet, useExternalEndpoi
 
 	if usePodNet || useExternalEndpoint {
 		klog.V(4).Infof("usePodNet: %v. useExternalEndpoint: %v", usePodNet, useExternalEndpoint)
-		return k8s.GetServiceEndPointsWithLister(m.endpointSliceLister, svc, addrType, matchNodeList)
+		return k8s.GetServiceEndPointsWithMetadata(m.endpointSliceLister, m.podLister, svc, addrType, matchNodeList, readMeta)
 		//return k8s.GetServicePodEndpoints(m.kubeClient, svc, addrType, matchNodeList)
 	}
 
 	if svc.Spec.ExternalTrafficPolicy == corev1.ServiceExternalTrafficPolicyTypeLocal {
-		//klog.Infof("getEndpoints: Traffic Policy Local %d", len(matchNodeList))
-		return k8s.GetServiceLocalEndpoints(m.kubeClient, svc, addrType, matchNodeList)
+		endpoints, err := k8s.GetServiceLocalEndpoints(m.kubeClient, svc, addrType, matchNodeList)
+		return makeEndpointEntries(endpoints), err
 	}
-	return m.getNodeEndpoints(addrType, matchNodeList)
+	endpoints, err := m.getNodeEndpoints(addrType, matchNodeList)
+	return makeEndpointEntries(endpoints), err
+}
+
+func makeEndpointEntries(endpointIPs []string) []k8s.EndpointEntry {
+	entries := make([]k8s.EndpointEntry, 0, len(endpointIPs))
+	for _, endpointIP := range endpointIPs {
+		entries = append(entries, k8s.EndpointEntry{IP: endpointIP, Weight: 1})
+	}
+
+	return entries
 }
 
 // getNodeEndpoints returns the IP list of nodes available as nodePort service.
@@ -1528,7 +1766,7 @@ func (m *Manager) checkUpdateExternalIP(ingSvcPairs []SvcPair, svc *corev1.Servi
 	return false
 }
 
-func (m *Manager) checkUpdateEndpoints(svc *corev1.Service, cacheKey string, endpointIPs []string, matchPorts bool) bool {
+func (m *Manager) checkUpdateEndpoints(svc *corev1.Service, cacheKey string, endpoints []k8s.EndpointEntry, matchPorts bool) bool {
 	var update bool
 
 	if matchPorts {
@@ -1539,12 +1777,14 @@ func (m *Manager) checkUpdateEndpoints(svc *corev1.Service, cacheKey string, end
 		if err != nil {
 			return true
 		}
-		for _, endpoint := range endpointIPs {
+		for _, endpoint := range endpoints {
 			for _, tport := range tports {
 				loxiEndpointModelList = append(loxiEndpointModelList, api.LoadBalancerEndpoint{
-					EndpointIP: endpoint,
+					EndpointIP: endpoint.IP,
 					TargetPort: uint16(tport),
-					Weight:     1,
+					Weight:     endpoint.Weight,
+					EpRole:     int32(endpoint.EpRole),
+					NixlPort:   endpoint.NixlPort,
 				})
 			}
 		}
@@ -1580,12 +1820,15 @@ func (m *Manager) checkUpdateEndpoints(svc *corev1.Service, cacheKey string, end
 	for _, sp := range m.lbCache[cacheKey].LbServicePairs {
 		// Check if endpoint list has changed
 		for _, lb := range sp.LbModelList {
-			if len(endpointIPs) == len(lb.Endpoints) {
+			if len(endpoints) == len(lb.Endpoints) {
 				nEps := 0
-				for _, ep := range endpointIPs {
+				for _, ep := range endpoints {
 					found := false
 					for _, oldEp := range lb.Endpoints {
-						if ep == oldEp.EndpointIP {
+						if ep.IP == oldEp.EndpointIP &&
+							ep.Weight == oldEp.Weight &&
+							int32(ep.EpRole) == oldEp.EpRole &&
+							ep.NixlPort == oldEp.NixlPort {
 							found = true
 							nEps++
 							break
@@ -1595,7 +1838,7 @@ func (m *Manager) checkUpdateEndpoints(svc *corev1.Service, cacheKey string, end
 						break
 					}
 				}
-				if nEps != len(endpointIPs) {
+				if nEps != len(endpoints) {
 					update = true
 				}
 			} else {
@@ -1945,9 +2188,9 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 		lbOper = api.LBOPAttach
 	}
 
-	if len(lbArgs.endpointIPs) > 0 {
+	if len(lbArgs.endpoints) > 0 {
 
-		for _, endpoint := range lbArgs.endpointIPs {
+		for _, endpoint := range lbArgs.endpoints {
 
 			var tports []int
 			var err error
@@ -1971,9 +2214,11 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 
 			for _, tport := range tports {
 				loxiEndpointModelList = append(loxiEndpointModelList, api.LoadBalancerEndpoint{
-					EndpointIP: endpoint,
+					EndpointIP: endpoint.IP,
 					TargetPort: uint16(tport),
-					Weight:     1,
+					Weight:     endpoint.Weight,
+					EpRole:     int32(endpoint.EpRole),
+					NixlPort:   endpoint.NixlPort,
 				})
 			}
 		}
@@ -2009,28 +2254,38 @@ func (m *Manager) makeLoxiLoadBalancerModel(lbArgs *LbArgs, svc *corev1.Service,
 
 	return api.LoadBalancerModel{
 		Service: api.LoadBalancerService{
-			ExternalIP:   lbArgs.externalIP,
-			PrivateIP:    lbArgs.privateIP,
-			Port:         uint16(port.Port),
-			Protocol:     strings.ToLower(string(port.Protocol)),
-			BGP:          bgpMode,
-			Mode:         lbModeSvc,
-			Oper:         lbOper,
-			Monitor:      lbArgs.livenessCheck,
-			Timeout:      uint32(lbArgs.timeout),
-			Managed:      true,
-			ProbeType:    lbArgs.probeType,
-			ProbePort:    lbArgs.probePort,
-			ProbeReq:     lbArgs.probeReq,
-			ProbeResp:    lbArgs.probeResp,
-			ProbeTimeout: lbArgs.probeTimeo,
-			ProbeRetries: int32(lbArgs.probeRetries),
-			PpV2:         lbArgs.ppv2En,
-			Egress:       lbArgs.egress,
-			Sel:          lbArgs.sel,
-			Name:         fmt.Sprintf("%s_%s:%s", svc.Namespace, svc.Name, lbArgs.inst),
-			MtlsFrontend: lbArgs.mtlsFrontend,
-			MtlsBackend:  lbArgs.mtlsBackend,
+			ExternalIP:                  lbArgs.externalIP,
+			PrivateIP:                   lbArgs.privateIP,
+			Port:                        uint16(port.Port),
+			Protocol:                    strings.ToLower(string(port.Protocol)),
+			BGP:                         bgpMode,
+			Mode:                        lbModeSvc,
+			Oper:                        lbOper,
+			Monitor:                     lbArgs.livenessCheck,
+			Timeout:                     uint32(lbArgs.timeout),
+			Managed:                     true,
+			ProbeType:                   lbArgs.probeType,
+			ProbePort:                   lbArgs.probePort,
+			ProbeReq:                    lbArgs.probeReq,
+			ProbeResp:                   lbArgs.probeResp,
+			ProbeTimeout:                lbArgs.probeTimeo,
+			ProbeRetries:                int32(lbArgs.probeRetries),
+			PpV2:                        lbArgs.ppv2En,
+			Egress:                      lbArgs.egress,
+			Sel:                         lbArgs.sel,
+			Name:                        fmt.Sprintf("%s_%s:%s", svc.Namespace, svc.Name, lbArgs.inst),
+			Security:                    lbArgs.lbSec,
+			Host:                        lbArgs.host,
+			ModelName:                   lbArgs.modelName,
+			SSEMode:                     lbArgs.sseMode,
+			MaxStreamDurationSec:        lbArgs.maxStreamDuration,
+			BackendKeepaliveIntervalSec: lbArgs.backendKeepalive,
+			PathPrefix:                  lbArgs.pathPrefix,
+			BackendProtocol:             lbArgs.backendProtocol,
+			PathMatchMode:               lbArgs.pathMatchMode,
+			SessionHeaderName:           lbArgs.sessionHeaderName,
+			MtlsFrontend:                lbArgs.mtlsFrontend,
+			MtlsBackend:                 lbArgs.mtlsBackend,
 		},
 		SrcIPs:       loxiLbAllowedSrcIpList,
 		SecondaryIPs: loxiSecIPModelList,

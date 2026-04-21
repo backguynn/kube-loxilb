@@ -21,10 +21,16 @@ const (
 	LbSelLeastConnections
 	// LbSelN2 - select client based on N2 interface contents
 	LbSelN2
-	// LbSelN2DET - select client based on N2DET contents
-	LbSelN2DET
 	// LbSelN3 - select client based on N3 interface contents
 	LbSelN3
+	// reserved enterprise slot
+	_
+	// LbSelCHWBL - select client based on consistent hash with bounded loads
+	LbSelCHWBL
+	// LbSelGPUAware - select client based on GPU-aware routing
+	LbSelGPUAware
+	// LbSelWRRHash - select client based on weighted consistent hash with bounded loads
+	LbSelWRRHash
 )
 
 type LbMode int32
@@ -57,11 +63,13 @@ const (
 	BackendProtocolHTTP1 BackendProtocolType = "http1"
 	// BackendProtocolHTTP2 - HTTP/2 protocol
 	BackendProtocolHTTP2 BackendProtocolType = "http2"
+	// BackendProtocolBoth - ALPN negotiation for HTTP/1.1 and HTTP/2
+	BackendProtocolBoth BackendProtocolType = "both"
 )
 
 // IsValid checks if the backend protocol is valid
 func (b BackendProtocolType) IsValid() bool {
-	return b == "" || b == BackendProtocolHTTP1 || b == BackendProtocolHTTP2
+	return b == "" || b == BackendProtocolHTTP1 || b == BackendProtocolHTTP2 || b == BackendProtocolBoth
 }
 
 type PathMatchModeType string
@@ -133,35 +141,55 @@ func (lbModel *LoadBalancerModel) GetKeyStruct() LoxiModel {
 }
 
 type LoadBalancerService struct {
-	ExternalIP      string              `json:"externalIP" key:"externalipaddress"`
-	PrivateIP       string              `json:"privateIP" key:"privateipaddress"`
-	Port            uint16              `json:"port" key:"port"`
-	Protocol        string              `json:"protocol" key:"protocol"`
-	Sel             EpSelect            `json:"sel"`
-	Mode            LbMode              `json:"mode"`
-	BGP             bool                `json:"BGP" options:"bgp"`
-	Monitor         bool                `json:"Monitor"`
-	Timeout         uint32              `json:"inactiveTimeOut"`
-	Block           uint32              `json:"block" options:"block"`
-	Managed         bool                `json:"managed,omitempty"`
-	ProbeType       string              `json:"probetype"`
-	ProbePort       uint16              `json:"probeport"`
-	ProbeReq        string              `json:"probereq"`
-	ProbeResp       string              `json:"proberesp"`
-	ProbeRetries    int32               `json:"probeRetries,omitempty"`
-	ProbeTimeout    uint32              `json:"probeTimeout,omitempty"`
-	Security        int32               `json:"security,omitempty"`
-	Name            string              `json:"name,omitempty"`
-	Oper            LbOP                `json:"oper,omitempty"`
-	Host            string              `json:"host,omitempty"`
-	PpV2            bool                `json:"proxyprotocolv2,omitempty"`
-	Egress          bool                `json:"egress,omitempty"`
-	Snat            bool                `json:"snat,omitempty"`
-	PathPrefix      string              `json:"path_prefix,omitempty"`
-	BackendProtocol BackendProtocolType `json:"backend_protocol,omitempty"`
-	PathMatchMode   PathMatchModeType   `json:"path_match_mode,omitempty"`
-	MtlsFrontend    *MtlsFrontend       `json:"mtls_frontend,omitempty"`
-	MtlsBackend     *MtlsBackend        `json:"mtls_backend,omitempty"`
+	ExternalIP                  string              `json:"externalIP" key:"externalipaddress"`
+	PrivateIP                   string              `json:"privateIP" key:"privateipaddress"`
+	Port                        uint16              `json:"port" key:"port"`
+	Protocol                    string              `json:"protocol" key:"protocol"`
+	Sel                         EpSelect            `json:"sel"`
+	Mode                        LbMode              `json:"mode"`
+	BGP                         bool                `json:"BGP" options:"bgp"`
+	Monitor                     bool                `json:"Monitor"`
+	Timeout                     uint32              `json:"inactiveTimeOut"`
+	Block                       uint32              `json:"block" options:"block"`
+	Managed                     bool                `json:"managed,omitempty"`
+	ProbeType                   string              `json:"probetype"`
+	ProbePort                   uint16              `json:"probeport"`
+	ProbeReq                    string              `json:"probereq"`
+	ProbeResp                   string              `json:"proberesp"`
+	ProbeRetries                int32               `json:"probeRetries,omitempty"`
+	ProbeTimeout                uint32              `json:"probeTimeout,omitempty"`
+	Security                    int32               `json:"security,omitempty"`
+	Name                        string              `json:"name,omitempty"`
+	Oper                        LbOP                `json:"oper,omitempty"`
+	Host                        string              `json:"host,omitempty"`
+	PpV2                        bool                `json:"proxyprotocolv2,omitempty"`
+	Egress                      bool                `json:"egress,omitempty"`
+	Snat                        bool                `json:"snat,omitempty"`
+	ModelName                   string              `json:"model_name,omitempty"`
+	SSEMode                     bool                `json:"sse_mode,omitempty"`
+	MaxStreamDurationSec        uint32              `json:"max_stream_duration_sec,omitempty"`
+	BackendKeepaliveIntervalSec uint32              `json:"backend_keepalive_interval_sec,omitempty"`
+	PathPrefix                  string              `json:"path_prefix,omitempty"`
+	BackendProtocol             BackendProtocolType `json:"backend_protocol,omitempty"`
+	PathMatchMode               PathMatchModeType   `json:"path_match_mode,omitempty"`
+	SessionHeaderName           string              `json:"session_header_name,omitempty"`
+	PDDisaggMode                bool                `json:"pd_disagg_mode,omitempty"`
+	PDCacheAwareMode            bool                `json:"pd_cache_aware_mode,omitempty"`
+	PDSessionTTLSec             uint32              `json:"pd_session_ttl_sec,omitempty"`
+	PDCacheThreshold            uint8               `json:"pd_cache_threshold,omitempty"`
+	PDBalanceAbsThreshold       uint8               `json:"pd_balance_abs_threshold,omitempty"`
+	KvExactMode                 uint8               `json:"kvExactMode,omitempty"`
+	KvBlockSize                 uint32              `json:"kvBlockSize,omitempty"`
+	KvHashAlgo                  string              `json:"kvHashAlgo,omitempty"`
+	KvZmqPort                   uint16              `json:"kvZmqPort,omitempty"`
+	KvWarmupSec                 uint32              `json:"kvWarmupSec,omitempty"`
+	CHWBLPrefixHashLevel        int                 `json:"chwbl_prefix_hash_level,omitempty"`
+	CHWBLPrefixHashFlags        int                 `json:"chwbl_prefix_hash_flags,omitempty"`
+	CHWBLMeanLoadFactor         int                 `json:"chwbl_mean_load_factor,omitempty"`
+	CHWBLReplication            int                 `json:"chwbl_replication,omitempty"`
+	CHWBLEnableCacheSalt        bool                `json:"chwbl_enable_cache_salt,omitempty"`
+	MtlsFrontend                *MtlsFrontend       `json:"mtls_frontend,omitempty"`
+	MtlsBackend                 *MtlsBackend        `json:"mtls_backend,omitempty"`
 }
 
 func (lbService *LoadBalancerService) GetKeyStruct() LoxiModel {
@@ -172,6 +200,8 @@ type LoadBalancerEndpoint struct {
 	EndpointIP string `json:"endpointIP"`
 	TargetPort uint16 `json:"targetPort"`
 	Weight     uint8  `json:"weight"`
+	EpRole     int32  `json:"ep_role,omitempty"`
+	NixlPort   uint16 `json:"nixl_port,omitempty"`
 	State      string `json:"state"`
 	Counter    string `json:"counter"`
 }

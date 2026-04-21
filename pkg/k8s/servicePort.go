@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"time"
 
 	tk "github.com/loxilb-io/loxilib"
@@ -28,9 +29,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	clientset "k8s.io/client-go/kubernetes"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	discoverylisters "k8s.io/client-go/listers/discovery/v1"
 	"k8s.io/klog/v2"
 )
+
+const (
+	endpointRoleLabel     = "loxilb.io/ep-role"
+	endpointNixlPortAnnot = "loxilb.io/nixl-port"
+	endpointWeightAnnot   = "loxilb.io/ep-weight"
+	defaultEndpointWeight = 1
+	maxEndpointWeight     = 10
+)
+
+type EndpointEntry struct {
+	IP       string
+	EpRole   int
+	NixlPort uint16
+	Weight   uint8
+}
 
 func GetServicePortIntValue(kubeClient clientset.Interface, svc *corev1.Service, port corev1.ServicePort) ([]int, error) {
 	if port.TargetPort.IntValue() != 0 {
@@ -233,6 +250,103 @@ func GetServiceEndPointsWithLister(endpointSliceLister discoverylisters.Endpoint
 
 	klog.V(4).Infof("GetServiceEndPointsWithLister return retIPs: %v", retIPs)
 	return retIPs, nil
+}
+
+func GetServiceEndPointsWithMetadata(endpointSliceLister discoverylisters.EndpointSliceLister, podLister corev1listers.PodLister, svc *corev1.Service, addrType string, nodeMatchList []string, readMeta bool) ([]EndpointEntry, error) {
+	entries := make([]EndpointEntry, 0)
+
+	selector := labels.SelectorFromSet(labels.Set{
+		discoveryv1.LabelServiceName: svc.Name,
+	})
+
+	endpointSlices, err := endpointSliceLister.EndpointSlices(svc.Namespace).List(selector)
+	if err != nil {
+		return entries, err
+	}
+
+	entryByIP := make(map[string]EndpointEntry)
+	for _, eps := range endpointSlices {
+		for _, endpoint := range eps.Endpoints {
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+
+			entryMeta := EndpointEntry{Weight: defaultEndpointWeight}
+			if readMeta && podLister != nil && endpoint.TargetRef != nil && endpoint.TargetRef.Kind == "Pod" {
+				pod, err := podLister.Pods(svc.Namespace).Get(endpoint.TargetRef.Name)
+				if err == nil {
+					entryMeta.EpRole = parseEndpointRole(pod.Labels[endpointRoleLabel])
+					entryMeta.NixlPort = parseEndpointUint16(pod.Annotations[endpointNixlPortAnnot])
+					entryMeta.Weight = parseEndpointWeight(pod.Annotations[endpointWeightAnnot])
+				}
+			}
+
+			for _, addr := range endpoint.Addresses {
+				if addrType == "ipv6" {
+					if !tk.IsNetIPv6(addr) {
+						continue
+					}
+				} else {
+					if !tk.IsNetIPv4(addr) {
+						continue
+					}
+				}
+
+				entry := entryMeta
+				entry.IP = addr
+				entryByIP[addr] = entry
+			}
+		}
+	}
+
+	for _, entry := range entryByIP {
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+func parseEndpointRole(role string) int {
+	switch role {
+	case "prefill":
+		return 1
+	case "decode":
+		return 2
+	default:
+		return 0
+	}
+}
+
+func parseEndpointUint16(value string) uint16 {
+	if value == "" {
+		return 0
+	}
+
+	parsed, err := strconv.ParseUint(value, 10, 16)
+	if err != nil {
+		return 0
+	}
+
+	return uint16(parsed)
+}
+
+func parseEndpointWeight(value string) uint8 {
+	if value == "" {
+		return defaultEndpointWeight
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultEndpointWeight
+	}
+
+	if parsed < 1 {
+		parsed = 1
+	} else if parsed > maxEndpointWeight {
+		parsed = maxEndpointWeight
+	}
+
+	return uint8(parsed)
 }
 
 // GetLoxilbServiceEndPointsWithLister - Get loxilb service endpoints using EndpointSlice Lister
