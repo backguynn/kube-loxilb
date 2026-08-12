@@ -49,15 +49,30 @@ accept+=',application/vnd.docker.distribution.manifest.v2+json'
 referenced="$(mktemp)"
 trap 'rm -f "$referenced"' EXIT
 
+tags_total=0
+tags_resolved=0
+
 while read -r tag; do
   [ -n "$tag" ] || continue
-  curl -fsSL -H "Authorization: Bearer ${registry_token}" -H "Accept: ${accept}" \
+  tags_total=$(( tags_total + 1 ))
+  curl -fsSL --retry 3 --retry-delay 2 --retry-all-errors \
+    -H "Authorization: Bearer ${registry_token}" -H "Accept: ${accept}" \
     "https://ghcr.io/v2/${OWNER}/${PACKAGE}/manifests/${tag}" \
     | jq -r '.manifests[]?.digest // empty' >>"$referenced"
+  tags_resolved=$(( tags_resolved + 1 ))
 done < <(jq -r '.[].metadata.container.tags[]?' <<<"$versions")
 
+# Deleting on a partially built reference set would orphan the children of a
+# live multi-arch tag, so refuse to continue unless every tag was resolved.
+# "set -e" already aborts on a failed lookup; this keeps that guarantee
+# explicit if the loop above is ever refactored.
+if [ "$tags_resolved" -ne "$tags_total" ]; then
+  echo "${PACKAGE}: resolved only ${tags_resolved}/${tags_total} tags, refusing to delete" >&2
+  exit 1
+fi
+
 sort -u -o "$referenced" "$referenced"
-echo "${PACKAGE}: $(wc -l <"$referenced") child digest(s) referenced by tagged indexes"
+echo "${PACKAGE}: ${tags_total} tag(s) resolved, $(wc -l <"$referenced") child digest(s) referenced"
 
 now="$(date +%s)"
 deleted=0
