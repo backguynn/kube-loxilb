@@ -8,78 +8,139 @@ on:
         description: 'Tag Name'
         required: true
         default: 'latest'
+
+env:
+  IMAGE: ghcr.io/loxilb-io/kube-loxilb
+
 jobs:
+  # Forks only verify that the image still builds.
+  build-check:
+    if: github.repository != 'loxilb-io/kube-loxilb'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+
+  # One native runner per architecture. Nothing is tagged here: each job pushes
+  # a single-platform image addressed only by digest, and hands the digest to
+  # the merge job as an artifact.
   build:
-    runs-on: ubuntu-latest
-    name: docker-ci
+    if: github.repository == 'loxilb-io/kube-loxilb'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Checkout Branch
+        if: github.event.inputs.tagName != ''
+        run: |
+          git fetch --all --tags
+          git checkout ${{ github.event.inputs.tagName }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: TAG=${{ github.event.inputs.tagName }}
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Slugify platform
+        id: slug
+        run: echo "value=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ steps.slug.outputs.value }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assembles the per-arch digests into one manifest list and publishes the tag.
+  # This is the only step that makes anything user-visible, so a failed arch
+  # build never leaves a half-updated tag behind.
+  merge:
+    if: github.repository == 'loxilb-io/kube-loxilb'
+    needs: [build]
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
-    - uses: actions/checkout@v2
-      with:
-          submodules: recursive
+      - uses: actions/checkout@v4
 
-    - name : Checkout Branch
-      if:  github.event.inputs.tagName != ''
-      run: |
-          git fetch --all --tags
-          git checkout ${{ github.event.inputs.tagName }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
 
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v1
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
 
-    # Setup hardware emulator using QEMU
-    - name: Set up QEMU
-      uses: docker/setup-qemu-action@v2
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-    # Setup Docker Buildx for multi-arch images
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - name: Resolve tag
+        id: tag
+        run: echo "value=${TAG:-latest}" >> "$GITHUB_OUTPUT"
+        env:
+          TAG: ${{ github.event.inputs.tagName }}
 
-    - name: Build Check
-      if: |
-          github.repository != 'loxilb-io/kube-loxilb'
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        platforms: linux/amd64, linux/arm64
-        push: false
-        tags: ghcr.io/loxilb-io/kube-loxilb:latest
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ steps.tag.outputs.value }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
 
-    - name: Build and push to latest
-      if: |
-          github.repository == 'loxilb-io/kube-loxilb'
-          &&  github.event.inputs.tagName == ''
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        platforms: linux/amd64, linux/arm64
-        push: true
-        tags: ghcr.io/loxilb-io/kube-loxilb:latest
+      - name: Inspect
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.tag.outputs.value }}"
 
-    - name: Build and push to given tag
-      if: |
-          github.repository == 'loxilb-io/kube-loxilb'
-          &&  github.event.inputs.tagName != ''
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        platforms: linux/amd64, linux/arm64
-        push: true
-        build-args: TAG=${{ github.event.inputs.tagName }}
-        tags: ghcr.io/loxilb-io/kube-loxilb:${{ github.event.inputs.tagName }}
-
-    # Re-pushing :latest orphans the previous index and its per-platform child
-    # manifests. The script keeps every child that a tagged index still points
-    # at, so multi-arch tags stay intact.
-    - name: Cleanup untagged kube-loxilb versions
-      if: github.repository == 'loxilb-io/kube-loxilb'
-      continue-on-error: true
-      env:
-        GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN || secrets.GITHUB_TOKEN }}
-      run: .github/scripts/cleanup-untagged-packages.sh loxilb-io kube-loxilb
+      # push-by-digest leaves the per-arch manifests untagged, and the tag this
+      # run replaced orphans its own children. Reclaim whatever is no longer
+      # referenced by a tagged index.
+      - name: Cleanup untagged kube-loxilb versions
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN || secrets.GITHUB_TOKEN }}
+        run: .github/scripts/cleanup-untagged-packages.sh loxilb-io kube-loxilb
