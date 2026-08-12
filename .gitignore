@@ -16,3 +16,6 @@
 
 bin/
 docker-build.sh
+
+# Agent binary built outside of bin/
+/loxilb-agent
