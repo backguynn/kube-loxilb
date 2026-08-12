@@ -58,3 +58,12 @@ jobs:
           echo "passed: false."
           cat results.json
           exit 1
+
+      # Every run moves the :preflight tag to a new digest, and GHCR keeps the
+      # old one around forever as an untagged version. Sweep them here.
+      - name: Cleanup untagged kube-loxilb-ubi8 versions
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_CLEANUP_TOKEN || secrets.GITHUB_TOKEN }}
+        run: .github/scripts/cleanup-untagged-packages.sh loxilb-io kube-loxilb-ubi8
