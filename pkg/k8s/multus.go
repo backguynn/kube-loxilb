@@ -19,7 +19,6 @@ package k8s
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -52,8 +51,30 @@ func GetMultusNetworkName(ns, name string) string {
 func UnmarshalNetworkList(ns string) ([]networkList, error) {
 	data := []networkList{}
 	err := json.Unmarshal([]byte(ns), &data)
-	if err != nil {
-		return data, err
+	if err == nil {
+		return data, nil
+	}
+
+	trimmed := strings.TrimSpace(ns)
+	if trimmed == "" {
+		return nil, err
+	}
+
+	// Preserve JSON parsing errors for malformed structured annotations.
+	if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+		return nil, err
+	}
+
+	for _, name := range strings.Split(trimmed, ",") {
+		trimmedName := strings.TrimSpace(name)
+		if trimmedName == "" {
+			continue
+		}
+		data = append(data, networkList{Name: trimmedName})
+	}
+
+	if len(data) == 0 {
+		return nil, err
 	}
 
 	return data, nil
@@ -121,6 +142,8 @@ func GetMultusEndpoints(kubeClient clientset.Interface, svcNs, selectorLabelStr 
 			continue
 		}
 
+		klog.V(4).Infof("GetMultusEndpoints: inspecting pod %s/%s, networks=%s", pod.Namespace, pod.Name, multusNetworkListStr)
+
 		podNetList, err := UnmarshalNetworkList(multusNetworkListStr)
 		if err != nil {
 			podNetList = []networkList{{Name: multusNetworkListStr}}
@@ -128,12 +151,15 @@ func GetMultusEndpoints(kubeClient clientset.Interface, svcNs, selectorLabelStr 
 
 		networkStatusListStr, ok := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
 		if !ok {
-			return epList, errors.New("not found k8s.v1.cni.cncf.io/network-status annotation.")
+			klog.Warningf("GetMultusEndpoints: skipping pod %s/%s because network-status annotation is missing. networks=%s", pod.Namespace, pod.Name, multusNetworkListStr)
+			continue
 		}
+
+		klog.V(4).Infof("GetMultusEndpoints: pod %s/%s network-status=%s", pod.Namespace, pod.Name, networkStatusListStr)
 
 		networkStatusList, err := UnmarshalNetworkStatus(networkStatusListStr)
 		if err != nil {
-			return epList, err
+			return epList, fmt.Errorf("failed to parse network-status annotation for pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		}
 
 		for _, mNet := range podNetList {
@@ -165,8 +191,11 @@ func GetMultusEndpoints(kubeClient clientset.Interface, svcNs, selectorLabelStr 
 				continue
 			}
 
+			foundStatus := false
+
 			for _, ns := range networkStatusList {
 				if ns.Name == podMultusNetName {
+					foundStatus = true
 					if len(ns.Ips) > 0 {
 						for _, ip := range ns.Ips {
 							if AddrInFamily(addrType, ip) {
@@ -175,6 +204,10 @@ func GetMultusEndpoints(kubeClient clientset.Interface, svcNs, selectorLabelStr 
 						}
 					}
 				}
+			}
+
+			if !foundStatus {
+				klog.Warningf("GetMultusEndpoints: pod %s/%s matched multus network %s but network-status did not contain it. network-status=%s", pod.Namespace, pod.Name, podMultusNetName, networkStatusListStr)
 			}
 		}
 	}
